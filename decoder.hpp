@@ -9,9 +9,6 @@
 // Linux Kernel V4L2 specification (video for linux)
 // https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/v4l2.html
 
-// 6by9's V4L2 M2M C example
-// https://github.com/6by9/v4l2_m2m/blob/master/m2m.c
-
 #pragma once
 #include <fcntl.h>
 #include <unistd.h>
@@ -75,15 +72,17 @@ private:
 
         do {
             status = ioctl(fd, request, arg);
-        } while (status == -1 && errno == EINTR);
+        } while (status == -1 && (errno == EINTR || errno == EAGAIN));
+        // TODO: poll not while
 
+        cout << strerror(errno) << "\n";
         return status;
     }
 
     void munmapBuffers(vector<MemoryBuffer> &output) {
         for(const auto &buffer : output) {
             for(int j = 0; j < buffer.start.size(); j++) {
-                // TODO: check for improper unallocated behaviour
+                // TODO: check for improper unallocated behaviour of int of &output
                 if(buffer.start[j] != MAP_FAILED) {
                     munmap(buffer.start[j], buffer.planes[j].length);
                 }
@@ -133,22 +132,20 @@ private:
                     munmapBuffers(output);
                     return InitStatus::FAILED;
                 }
-
-                // output[i].length[j] = buffer.m.planes[j].length;
             }
         }
 
         return InitStatus::OK;
     }
 
-    InitStatus queueBuffers(const int fd, const int type, const int planes, const vector<MemoryBuffer> &output) {
+    InitStatus queueBuffers(const int fd, const int type, const int planes, vector<MemoryBuffer> &output) {
         for(int i = 0; i < output.size(); i++) {
             struct v4l2_buffer buffer = {};
 
             buffer.type = type;
             buffer.memory = V4L2_MEMORY_MMAP;
             buffer.index = i;
-            buffer.m.planes = decoderInputBuffer[i].planes.data();
+            buffer.m.planes = output[i].planes.data();
             buffer.length = planes;
 
             if(xioctl(fd, VIDIOC_QBUF, &buffer) < 0) {
@@ -286,12 +283,15 @@ public:
                 xioctl(decoder, VIDIOC_STREAMON, &inputType) < 0 ||
                 xioctl(decoder, VIDIOC_STREAMON, &outputType) < 0
             ) {
+                cout << "streamon failed\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
 
             decodeStreamStarted = true;
         }
+
+        cout << "here\n";
 
         // start decoding
         int remaining = data.size();
@@ -305,14 +305,17 @@ public:
 
                 inputBuffer.type = inputType;
                 inputBuffer.memory = V4L2_MEMORY_MMAP;
+                inputBuffer.index = i;
                 inputBuffer.m.planes = decoderInputBuffer[i].planes.data();
                 inputBuffer.length = 1;
-                inputBuffer.index = i;
 
+                cout << "queue debuffer start\n";
                 if(xioctl(decoder, VIDIOC_DQBUF, &inputBuffer) < 0) {
+                    cout << "queue debuffer fail\n";
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
+                cout << "queue debuffer end\n";
 
                 // take maximal size currently from input buffer chunk
                 cout << "inputBuffer.index " << inputBuffer.index << "\n";
