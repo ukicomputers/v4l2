@@ -21,12 +21,13 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <poll.h>
+#include <algorithm> // just for std::min
 using namespace std;
 
 // as per rpiv4l2
 const string decoderDev = "/dev/video10";
 const string converterDev = "/dev/video12";
-const int bufferCount = 4;
 
 struct Decoder {
     enum class InitStatus {
@@ -40,9 +41,7 @@ struct Decoder {
     enum class Status {
         OK,
         NOT_INITIALIZED,
-        INVALID_DATA_PROVIDED,
-        FAILED,
-        FREEING_FAILED
+        FAILED
     };
 
     struct DecodedFrame {
@@ -55,7 +54,7 @@ struct Decoder {
 private:
     struct MemoryBuffer {
         vector<void *> start;
-        vector<struct v4l2_plane> planes;
+        vector<v4l2_plane> planes;
     };
 
     int decoder;
@@ -67,15 +66,35 @@ private:
     int converter;
     bool converterInitialized = false;
 
+    bool waitEvent(int fd, short events, int timeout = 100) {
+        pollfd descriptor;
+        descriptor.fd = fd;
+        descriptor.events = events;
+        descriptor.revents = 0;
+
+        int ret = poll(&descriptor, 1, timeout);
+        if(ret <= 0) {
+            // poll timeout or fail
+            cout << "POLL TIMEOUT\n";
+            return false;
+        }
+
+        // if requested events are successfully executed in done events
+        return (descriptor.revents & events) != 0;
+    }
+
     int xioctl(int fd, int request, void *arg) {
         int status;
 
         do {
+            cout << "xioctl and again\n";
             status = ioctl(fd, request, arg);
-        } while (status == -1 && (errno == EINTR || errno == EAGAIN));
-        // TODO: poll not while
+        } while (status == -1 && errno == EINTR);
 
-        cout << strerror(errno) << "\n";
+        if(status == -1) {
+            cout << "xioctl errno " << errno << ": " << strerror(errno) << "\n";
+        }
+
         return status;
     }
 
@@ -91,7 +110,7 @@ private:
     }
 
     InitStatus mmapBuffers(const int fd, const int type, const int planes, const int bufferCount, vector<MemoryBuffer> &output) {
-        struct v4l2_requestbuffers reqBuffer = {};
+        v4l2_requestbuffers reqBuffer = {};
         reqBuffer.count = bufferCount;
         reqBuffer.type = type;
         reqBuffer.memory = V4L2_MEMORY_MMAP;
@@ -111,7 +130,7 @@ private:
         output.resize(reqBuffer.count);
 
         for(int i = 0; i < reqBuffer.count; i++) {
-            struct v4l2_buffer buffer = {};
+            v4l2_buffer buffer = {};
             output[i].planes.resize(planes);            
 
             buffer.type = type;
@@ -133,20 +152,6 @@ private:
                     return InitStatus::FAILED;
                 }
             }
-        }
-
-        return InitStatus::OK;
-    }
-
-    InitStatus queueBuffers(const int fd, const int type, const int planes, vector<MemoryBuffer> &output) {
-        for(int i = 0; i < output.size(); i++) {
-            struct v4l2_buffer buffer = {};
-
-            buffer.type = type;
-            buffer.memory = V4L2_MEMORY_MMAP;
-            buffer.index = i;
-            buffer.m.planes = output[i].planes.data();
-            buffer.length = planes;
 
             if(xioctl(fd, VIDIOC_QBUF, &buffer) < 0) {
                 return InitStatus::FAILED;
@@ -190,19 +195,18 @@ public:
         }
 
         // open video devices
-        // note: blocking device is used even if v4l docs says it should be used with O_NONBLOCK
         decoder = open(videoDevice.c_str(), O_RDWR | O_NONBLOCK);
         if(decoder < 0) {
             return InitStatus::DEVICE_NOT_FOUND;
         }
 
         // encoder input specification (H264)
-        struct v4l2_format inputFmt = {};
+        v4l2_format inputFmt = {};
         inputFmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         inputFmt.fmt.pix_mp.width = width;
         inputFmt.fmt.pix_mp.height = height;
         inputFmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
-        inputFmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
+        inputFmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
         inputFmt.fmt.pix_mp.num_planes = 1;
 
         // ioctl sets (programs) devices with cetain options
@@ -215,7 +219,7 @@ public:
         }
 
         // encoder output specification (H264 -> YU12)
-        struct v4l2_format outputFmt = {};
+        v4l2_format outputFmt = {};
         outputFmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         outputFmt.fmt.pix_mp.width = width;
         outputFmt.fmt.pix_mp.height = height;
@@ -231,29 +235,16 @@ public:
             return InitStatus::FAILED;
         }
 
-        // sadly, we need to use mmap for input buffer also
-        {
-            // decoding input buffer request
-            InitStatus status = mmapBuffers(decoder, inputFmt.type, inputFmt.fmt.pix_mp.num_planes, 1, decoderInputBuffer);
-            if(status != InitStatus::OK) {
-                return status;
-            }
-            
-            if(queueBuffers(decoder, inputFmt.type, inputFmt.fmt.pix_mp.num_planes, decoderInputBuffer) != InitStatus::OK) {
-                return InitStatus::FAILED;
-            }
+        // decoding input buffer request
+        InitStatus outputStatus = mmapBuffers(decoder, inputFmt.type, inputFmt.fmt.pix_mp.num_planes, 4, decoderInputBuffer);
+        if(outputStatus != InitStatus::OK) {
+            return outputStatus;
         }
 
-        {
-            // decoding output buffer request
-            InitStatus status = mmapBuffers(decoder, outputFmt.type, outputFmt.fmt.pix_mp.num_planes, 4, decoderOutputBuffer);
-            if(status != InitStatus::OK) {
-                return status;
-            }   
-
-            if(queueBuffers(decoder, outputFmt.type, outputFmt.fmt.pix_mp.num_planes, decoderOutputBuffer) != InitStatus::OK) {
-                return InitStatus::FAILED;
-            }
+        // decoding output buffer request
+        InitStatus inputStatus = mmapBuffers(decoder, outputFmt.type, outputFmt.fmt.pix_mp.num_planes, 4, decoderOutputBuffer);
+        if(inputStatus != InitStatus::OK) {
+            return inputStatus;
         }
 
         decoderInitialized = true;
@@ -267,6 +258,7 @@ public:
     // this also means that if you provide whole H264 content at once, lastData needs to be set to true
     // input format also must be in Annex-B form
     DecodedFrame decode(const vector<uint8_t> &data, bool lastData) {
+        cout << "new decode call\n";
         DecodedFrame returnedOutput;
 
         if(!decoderInitialized) {
@@ -283,7 +275,6 @@ public:
                 xioctl(decoder, VIDIOC_STREAMON, &inputType) < 0 ||
                 xioctl(decoder, VIDIOC_STREAMON, &outputType) < 0
             ) {
-                cout << "streamon failed\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
@@ -291,90 +282,128 @@ public:
             decodeStreamStarted = true;
         }
 
-        cout << "here\n";
+        cout << "BEGIN\n";
 
-        // start decoding
-        int remaining = data.size();
-        const uint8_t *dataPtr = data.data();
+        // feeding input buffers
+        {
+            int remaining = data.size();
+            const uint8_t *dataPtr = data.data();
 
-        while(remaining > 0) {
-            for(int i = 0; i < decoderInputBuffer.size() && remaining > 0; i++) {
+            while(remaining > 0) {
                 // input buffer handling
-                struct v4l2_buffer inputBuffer = {};
-                // take note that H264 input format only has one plane
-
+                v4l2_buffer inputBuffer = {};
                 inputBuffer.type = inputType;
                 inputBuffer.memory = V4L2_MEMORY_MMAP;
-                inputBuffer.index = i;
-                inputBuffer.m.planes = decoderInputBuffer[i].planes.data();
-                inputBuffer.length = 1;
 
-                cout << "queue debuffer start\n";
+                vector<v4l2_plane> planeData(decoderInputBuffer[0].planes.size());
+                inputBuffer.m.planes = planeData.data();
+                inputBuffer.length = planeData.size();
+
                 if(xioctl(decoder, VIDIOC_DQBUF, &inputBuffer) < 0) {
-                    cout << "queue debuffer fail\n";
+                    // TODO: poll
+                    cout << "input buffer dequeue fail\n";
+
+                    if(errno == EAGAIN) {
+                        if(waitEvent(decoder, POLLOUT | POLLWRNORM)) {
+                            continue;
+                        }
+                    }
+
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
-                cout << "queue debuffer end\n";
+
+                cout << "choosed buffer input index " << inputBuffer.index << "\n";
 
                 // take maximal size currently from input buffer chunk
-                cout << "inputBuffer.index " << inputBuffer.index << "\n";
-                cout << "planeData[0].length " << decoderInputBuffer[i].planes[0].length << "\n";
-
-                const int copySize = min((int)decoderInputBuffer[i].planes[0].length, remaining);
-                if(copySize == 0 && remaining > 0) {
-                    returnedOutput.status = Status::INVALID_DATA_PROVIDED;
-                    return returnedOutput;
-                }
-
+                const int copySize = min((int)decoderInputBuffer[inputBuffer.index].planes[0].length, remaining);
+                cout << "copySize " << copySize << "\n";
+                
                 // set the decode data
-                memcpy(decoderInputBuffer[i].start[0], dataPtr, copySize);
-                decoderInputBuffer[i].planes[0].bytesused = copySize;
+                memcpy(decoderInputBuffer[inputBuffer.index].start[0], dataPtr, copySize);
+                decoderInputBuffer[inputBuffer.index].planes[0].bytesused = copySize;
 
+                cout << "flags before " << inputBuffer.flags << "\n";
                 if(remaining - copySize == 0 && lastData) {
-                    inputBuffer.flags = V4L2_BUF_FLAG_LAST;
-                } else {
-                    inputBuffer.flags = 0; // as per QBUF kernel spec
+                    inputBuffer.flags |= V4L2_BUF_FLAG_LAST;
+                    cout << "flags before " << inputBuffer.flags << "\n";
                 }
+
+                inputBuffer.m.planes = decoderInputBuffer[inputBuffer.index].planes.data();
 
                 if(xioctl(decoder, VIDIOC_QBUF, &inputBuffer) < 0) {
+                    cout << "BUFFER Q fail\n";
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
+
+                cout << "BUFFER Q end\n";
 
                 // move onto next item
                 remaining -= copySize;
                 dataPtr += copySize;
             }
+        }
 
-            for(int i = 0; i < decoderOutputBuffer.size(); i++) {
-                // get decoded output
-                struct v4l2_buffer outputBuffer = {};
-                outputBuffer.type = outputType;
-                outputBuffer.memory = V4L2_MEMORY_MMAP;
-                outputBuffer.m.planes = decoderOutputBuffer[i].planes.data();
-                outputBuffer.length = decoderOutputBuffer[i].planes.size();
-                outputBuffer.index = i;
+        // getting output buffers
+        while(true) {
+            cout << "new while decode loop\n";
 
-                if(xioctl(decoder, VIDIOC_DQBUF, &outputBuffer) < 0) {
-                    if(errno == EAGAIN) {
+            // get decoded output
+            v4l2_buffer outputBuffer = {};
+            outputBuffer.type = outputType;
+            outputBuffer.memory = V4L2_MEMORY_MMAP;
+            
+            // temporary plane vector
+            vector<v4l2_plane> planeData(decoderOutputBuffer[0].planes.size());
+            outputBuffer.m.planes = planeData.data();
+            outputBuffer.length = planeData.size();
+
+            if(xioctl(decoder, VIDIOC_DQBUF, &outputBuffer) < 0) {
+                cout << "fucking fail in DQBUF\n";
+                if(errno == EAGAIN) {
+                    // didn't process new incoming task yet
+                    cout << "EAGAIN in getbuf\n";
+                    if(waitEvent(decoder, POLLIN | POLLRDNORM)) {
                         continue;
                     }
-                    returnedOutput.status = Status::FAILED;
-                    return returnedOutput;
                 }
 
-                cout << "outputBuffer.index " << outputBuffer.index << "\n";
+                if(errno == EPIPE) {
+                    // no more data to decode
+                    break;
+                }
 
-                for(int j = 0; j < decoderOutputBuffer[i].planes.size(); j++) {
+                returnedOutput.status = Status::FAILED;
+                return returnedOutput;
+            }
+
+            cout << "got output from buffer index " << outputBuffer.index << "\n";
+
+            for(int j = 0; j < outputBuffer.length; j++) {
+                decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = planeData[j].bytesused;
+
+                if(decoderOutputBuffer[outputBuffer.index].planes[j].bytesused > 0) {
+                    cout << "COPYING DATA RN RN\n";
                     const uint8_t *decodedData = static_cast<const uint8_t *>(decoderOutputBuffer[outputBuffer.index].start[j]);
-                    returnedOutput.output.insert(returnedOutput.output.end(), decodedData, decodedData + decoderOutputBuffer[i].planes[j].bytesused);
+                    returnedOutput.output.insert(returnedOutput.output.end(), decodedData, decodedData + decoderOutputBuffer[outputBuffer.index].planes[j].bytesused);
+                    decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = 0;
                 }
+            }
 
-                if(xioctl(decoder, VIDIOC_QBUF, &outputBuffer) < 0) {
-                    returnedOutput.status = Status::FREEING_FAILED;
-                    return returnedOutput;
-                }
+            outputBuffer.m.planes = decoderOutputBuffer[outputBuffer.index].planes.data();
+
+            if(xioctl(decoder, VIDIOC_QBUF, &outputBuffer) < 0) {
+                // buffer memory reallocation failed
+                cout << "OUTPUT FREE FAIL\n";
+                returnedOutput.status = Status::FAILED;
+                return returnedOutput;
+            }
+
+            if(outputBuffer.flags & V4L2_BUF_FLAG_LAST) {
+                // TODO: check with documentation if we should queue even if last flag
+                cout << "HIT LAST FLAG\n";
+                break;
             }
         }
 

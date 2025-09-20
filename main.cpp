@@ -4,9 +4,9 @@
 using namespace std;
 
 const int videoWidth = 1920;
-const int videoHeight = 1048;
+const int videoHeight = 1080;
 const string videoPath = "video.h264";
-const string outputPath = "video.nv12";
+const string outputPath = "video.yuv";
 
 int main() {
     Decoder decoder;
