@@ -15,19 +15,20 @@
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/sysinfo.h>
 #include <cerrno>
 #include <string>
 #include <vector>
-#include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <poll.h>
 #include <algorithm> // just for std::min
+#include <fstream>
 using namespace std;
 
-// as per rpiv4l2
 const string decoderDev = "/dev/video10";
 const string converterDev = "/dev/video12";
+const int eventTimeout = 500;
+const int memoryThreshold = 51200;
 
 struct Decoder {
     enum class InitStatus {
@@ -41,6 +42,7 @@ struct Decoder {
     enum class Status {
         OK,
         NOT_INITIALIZED,
+        INSUFFICIENT_MEMORY,
         FAILED
     };
 
@@ -49,7 +51,10 @@ struct Decoder {
         Status status = Status::OK;
 
         // vector of decoded/converted colors
-        vector<uint8_t> output;
+        vector<unsigned int> output;
+
+        // provided output size
+        pair<int, int> imageSize;
     };
 private:
     struct MemoryBuffer {
@@ -62,20 +67,22 @@ private:
     bool decodeStreamStarted = false;
     vector<MemoryBuffer> decoderOutputBuffer;
     vector<MemoryBuffer> decoderInputBuffer;
+    pair<int, int> decoderOutputSize;
 
     int converter;
     bool converterInitialized = false;
 
-    bool waitEvent(int fd, short events, int timeout = 100) {
+    int memoryLimit; // in KiB
+
+    bool waitEvent(int fd, short events) {
         pollfd descriptor;
         descriptor.fd = fd;
         descriptor.events = events;
         descriptor.revents = 0;
 
-        int ret = poll(&descriptor, 1, timeout);
+        int ret = poll(&descriptor, 1, eventTimeout);
         if(ret <= 0) {
             // poll timeout or fail
-            cout << "POLL TIMEOUT\n";
             return false;
         }
 
@@ -87,13 +94,8 @@ private:
         int status;
 
         do {
-            cout << "xioctl and again\n";
             status = ioctl(fd, request, arg);
         } while (status == -1 && errno == EINTR);
-
-        if(status == -1) {
-            cout << "xioctl errno " << errno << ": " << strerror(errno) << "\n";
-        }
 
         return status;
     }
@@ -101,7 +103,7 @@ private:
     void munmapBuffers(vector<MemoryBuffer> &output) {
         for(const auto &buffer : output) {
             for(int j = 0; j < buffer.start.size(); j++) {
-                // TODO: check for improper unallocated behaviour of int of &output
+                // TODO: check for improper unallocated behaviour of int in &output
                 if(buffer.start[j] != MAP_FAILED) {
                     munmap(buffer.start[j], buffer.planes[j].length);
                 }
@@ -160,10 +162,51 @@ private:
 
         return InitStatus::OK;
     }
+
+    int getMemoryUsage() {
+        ifstream status("/proc/self/status");
+        if(!status) return -1;
+
+        string data;
+        while(getline(status, data)) {
+            if(data.find("VmRSS") != string::npos) {
+                int usage = -1;
+                sscanf(data.c_str(), "VmRSS: %d kB", &usage);
+                return usage;
+            }
+        }
+
+        return -1;
+    }
+
+    int getFreeMemory() {
+        struct sysinfo info;
+        if(sysinfo(&info) != 0) {
+            return -1;
+        }
+
+        return ((info.freeram + info.freeswap) * info.mem_unit) / 1024;
+    }
+
+    bool decodeMemoryAvailable() {
+        if(memoryLimit == -1) {
+            if(getFreeMemory() >= memoryThreshold) {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            if(getMemoryUsage() >= memoryLimit) {
+                return false;
+            } else {
+                return true;
+            }
+        }
+    }
 public:
     ~Decoder() { unload(); }
 
-    void unload() {
+    void stopDecoder() {
         if(decodeStreamStarted) {
             int inputType = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
             int outputType = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -171,6 +214,10 @@ public:
             xioctl(decoder, VIDIOC_STREAMOFF, &outputType);
             decodeStreamStarted = false;
         }
+    }
+
+    void unload() {
+        stopDecoder();
 
         if(decoderInitialized) {
             munmapBuffers(decoderInputBuffer);
@@ -186,10 +233,27 @@ public:
 
         decoderInputBuffer.clear();
         decoderOutputBuffer.clear();
+        decoderOutputSize = {};
     }
 
-    // requires fixed video width and height
-    InitStatus initializeDecoder(const int width, const int height, const string videoDevice = decoderDev) {
+    /*
+        note for memory management:
+
+        if decoding produces enormous amount of data for a big input file
+        it is guaranteed that it will exceed your memory and OOM killer will act
+
+        because of that, you can set maximum containing memory for this process
+        or just leave managing automatically by passing maxMemory = -1 (default)
+
+        if you set maximum containing memory, and if it exceeds global system memory
+        OOM will not be handled
+
+        INSUFFICIENT_MEMORY as Status from decoding function will be set in this case
+
+        also, width and height of input image must be constant (does not change through decoding)
+    */
+
+    InitStatus initializeDecoder(const int width, const int height, const int maxMemory = -1, const string videoDevice = decoderDev) {
         if(decoderInitialized) {
             return InitStatus::OK;
         }
@@ -209,7 +273,7 @@ public:
         inputFmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
         inputFmt.fmt.pix_mp.num_planes = 1;
 
-        // ioctl sets (programs) devices with cetain options
+        // ioctl sets (programs) devices with certain options
         if(xioctl(decoder, VIDIOC_S_FMT, &inputFmt) < 0) {
             close(decoder);
             if(errno == EINVAL) {
@@ -235,6 +299,14 @@ public:
             return InitStatus::FAILED;
         }
 
+        // get actual size
+        if(xioctl(decoder, VIDIOC_G_FMT, &outputFmt) < 0) {
+            close(decoder);
+            return InitStatus::FAILED;
+        }
+
+        decoderOutputSize = {(int)outputFmt.fmt.pix_mp.width, (int)outputFmt.fmt.pix_mp.height};
+
         // decoding input buffer request
         InitStatus outputStatus = mmapBuffers(decoder, inputFmt.type, inputFmt.fmt.pix_mp.num_planes, 4, decoderInputBuffer);
         if(outputStatus != InitStatus::OK) {
@@ -247,22 +319,39 @@ public:
             return inputStatus;
         }
 
+        memoryLimit = maxMemory;
         decoderInitialized = true;
         return InitStatus::OK;
     }
 
-    // note: once first frame is decoded, it is expected that you will decode from now continously (don't worry if there is some delay between)
-    // to avoid any GPU blocking, or similar, once you are finished with decoding completely, unload() the Decoder struct
-    // it's also assumed that provided decoding data has the fixed resolution (specified when initializeDecoder was called)
-    // if end of the H264 content/file is reached (when passing the last chunk), you should set lastData flag to true
-    // this also means that if you provide whole H264 content at once, lastData needs to be set to true
-    // input format also must be in Annex-B form
-    DecodedFrame decode(const vector<uint8_t> &data, bool lastData) {
-        cout << "new decode call\n";
+    /* 
+       notes for decoding:
+    
+       once first frame is decoded, it is expected that you will decode more frames
+       to avoid any GPU blocking externally, once you are finished with constant decoding, destructure, or call stopDecoder
+
+       if last part of the H264 content is passed, you should set lastData bool to true
+
+       input must be progressive, and in Annex-B form
+
+       you don't need to send full packets
+       for example, if reading from a file, you can read chunks, and send them here
+       when chunk is complete, the frame will be decoded and returned
+
+       outcome image size may be different since size needs to be divisible by decoder stepsize
+       image size will be increased to point of image size divisibility with stepsize
+    */
+    
+    DecodedFrame decode(const vector<char> &data, bool lastData) {
         DecodedFrame returnedOutput;
 
         if(!decoderInitialized) {
             returnedOutput.status = Status::NOT_INITIALIZED;
+            return returnedOutput;
+        }
+
+        if(!decodeMemoryAvailable()) {
+            returnedOutput.status = Status::INSUFFICIENT_MEMORY;
             return returnedOutput;
         }
 
@@ -282,12 +371,11 @@ public:
             decodeStreamStarted = true;
         }
 
-        cout << "BEGIN\n";
-
+        // TODO: subscribe to resolution change events
         // feeding input buffers
         {
             int remaining = data.size();
-            const uint8_t *dataPtr = data.data();
+            const char *dataPtr = data.data();
 
             while(remaining > 0) {
                 // input buffer handling
@@ -300,9 +388,6 @@ public:
                 inputBuffer.length = planeData.size();
 
                 if(xioctl(decoder, VIDIOC_DQBUF, &inputBuffer) < 0) {
-                    // TODO: poll
-                    cout << "input buffer dequeue fail\n";
-
                     if(errno == EAGAIN) {
                         if(waitEvent(decoder, POLLOUT | POLLWRNORM)) {
                             continue;
@@ -313,31 +398,23 @@ public:
                     return returnedOutput;
                 }
 
-                cout << "choosed buffer input index " << inputBuffer.index << "\n";
-
                 // take maximal size currently from input buffer chunk
                 const int copySize = min((int)decoderInputBuffer[inputBuffer.index].planes[0].length, remaining);
-                cout << "copySize " << copySize << "\n";
-                
+
                 // set the decode data
                 memcpy(decoderInputBuffer[inputBuffer.index].start[0], dataPtr, copySize);
                 decoderInputBuffer[inputBuffer.index].planes[0].bytesused = copySize;
 
-                cout << "flags before " << inputBuffer.flags << "\n";
                 if(remaining - copySize == 0 && lastData) {
                     inputBuffer.flags |= V4L2_BUF_FLAG_LAST;
-                    cout << "flags before " << inputBuffer.flags << "\n";
                 }
 
                 inputBuffer.m.planes = decoderInputBuffer[inputBuffer.index].planes.data();
 
                 if(xioctl(decoder, VIDIOC_QBUF, &inputBuffer) < 0) {
-                    cout << "BUFFER Q fail\n";
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
-
-                cout << "BUFFER Q end\n";
 
                 // move onto next item
                 remaining -= copySize;
@@ -347,7 +424,10 @@ public:
 
         // getting output buffers
         while(true) {
-            cout << "new while decode loop\n";
+            if(!decodeMemoryAvailable()) {
+                returnedOutput.status = Status::INSUFFICIENT_MEMORY;
+                return returnedOutput;
+            }
 
             // get decoded output
             v4l2_buffer outputBuffer = {};
@@ -360,10 +440,8 @@ public:
             outputBuffer.length = planeData.size();
 
             if(xioctl(decoder, VIDIOC_DQBUF, &outputBuffer) < 0) {
-                cout << "fucking fail in DQBUF\n";
                 if(errno == EAGAIN) {
                     // didn't process new incoming task yet
-                    cout << "EAGAIN in getbuf\n";
                     if(waitEvent(decoder, POLLIN | POLLRDNORM)) {
                         continue;
                     }
@@ -378,14 +456,11 @@ public:
                 return returnedOutput;
             }
 
-            cout << "got output from buffer index " << outputBuffer.index << "\n";
-
             for(int j = 0; j < outputBuffer.length; j++) {
                 decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = planeData[j].bytesused;
 
                 if(decoderOutputBuffer[outputBuffer.index].planes[j].bytesused > 0) {
-                    cout << "COPYING DATA RN RN\n";
-                    const uint8_t *decodedData = static_cast<const uint8_t *>(decoderOutputBuffer[outputBuffer.index].start[j]);
+                    const unsigned int *decodedData = static_cast<const unsigned int *>(decoderOutputBuffer[outputBuffer.index].start[j]);
                     returnedOutput.output.insert(returnedOutput.output.end(), decodedData, decodedData + decoderOutputBuffer[outputBuffer.index].planes[j].bytesused);
                     decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = 0;
                 }
@@ -394,19 +469,12 @@ public:
             outputBuffer.m.planes = decoderOutputBuffer[outputBuffer.index].planes.data();
 
             if(xioctl(decoder, VIDIOC_QBUF, &outputBuffer) < 0) {
-                // buffer memory reallocation failed
-                cout << "OUTPUT FREE FAIL\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
-
-            if(outputBuffer.flags & V4L2_BUF_FLAG_LAST) {
-                // TODO: check with documentation if we should queue even if last flag
-                cout << "HIT LAST FLAG\n";
-                break;
-            }
         }
 
+        returnedOutput.imageSize = decoderOutputSize;
         return returnedOutput;
     }
 };
