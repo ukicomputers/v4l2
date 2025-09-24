@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 #include <poll.h>
 #include <algorithm> // just for std::min
 #include <fstream>
@@ -51,7 +52,7 @@ struct Decoder {
         Status status = Status::OK;
 
         // vector of decoded/converted colors
-        vector<unsigned int> output;
+        vector<uint8_t> output;
 
         // provided output size
         pair<int, int> imageSize;
@@ -371,11 +372,12 @@ public:
             decodeStreamStarted = true;
         }
 
+        // TODO: maybe crop output image to original size
         // TODO: subscribe to resolution change events
         // feeding input buffers
         {
             int remaining = data.size();
-            const char *dataPtr = data.data();
+            const uint8_t *dataPtr = reinterpret_cast<const uint8_t *>(data.data());
 
             while(remaining > 0) {
                 // input buffer handling
@@ -460,7 +462,7 @@ public:
                 decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = planeData[j].bytesused;
 
                 if(decoderOutputBuffer[outputBuffer.index].planes[j].bytesused > 0) {
-                    const unsigned int *decodedData = static_cast<const unsigned int *>(decoderOutputBuffer[outputBuffer.index].start[j]);
+                    const uint8_t *decodedData = static_cast<const uint8_t *>(decoderOutputBuffer[outputBuffer.index].start[j]);
                     returnedOutput.output.insert(returnedOutput.output.end(), decodedData, decodedData + decoderOutputBuffer[outputBuffer.index].planes[j].bytesused);
                     decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = 0;
                 }
