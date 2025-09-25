@@ -48,7 +48,8 @@ int main() {
         auto decodingStart = chrono::high_resolution_clock::now();
 
         // decode the data
-        auto decodedFrame = decoder.decode(data, true);
+        bool isLast = (read < chunkSize || videoFile.peek() == EOF);
+        auto decodedFrame = decoder.decode(data, isLast);
 
         if(decodedFrame.status != Decoder::Status::OK) {
             cout << "Failed decoding, error code: " << static_cast<int>(decodedFrame.status) << "\n";
@@ -58,10 +59,11 @@ int main() {
         auto decodingEnd = chrono::high_resolution_clock::now();
         auto decodingDuration = chrono::duration_cast<chrono::milliseconds>(decodingEnd - decodingStart).count();
 
-        cout << "Decoded frame successfully in " << decodedFrame.imageSize.first << "x" << decodedFrame.imageSize.second << " for " << decodingDuration << "ms\n";
-
         // write chunk to a file
-        outputFile.write(reinterpret_cast<const char *>(decodedFrame.output.data()), decodedFrame.output.size());
+        if(!decodedFrame.output.empty()) {
+            cout << "Decoded frame successfully in " << decodedFrame.imageSize.first << "x" << decodedFrame.imageSize.second << " for " << decodingDuration << "ms\n";
+            outputFile.write(reinterpret_cast<const char *>(decodedFrame.output.data()), decodedFrame.output.size());
+        }
     }
 
     // unload and close the decoder

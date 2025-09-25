@@ -425,6 +425,8 @@ public:
         }
 
         // getting output buffers
+        bool gotOutput = false;
+
         while(true) {
             if(!decodeMemoryAvailable()) {
                 returnedOutput.status = Status::INSUFFICIENT_MEMORY;
@@ -446,6 +448,8 @@ public:
                     // didn't process new incoming task yet
                     if(waitEvent(decoder, POLLIN | POLLRDNORM)) {
                         continue;
+                    } else {
+                        break;
                     }
                 }
 
@@ -458,6 +462,7 @@ public:
                 return returnedOutput;
             }
 
+            gotOutput = true;
             for(int j = 0; j < outputBuffer.length; j++) {
                 decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = planeData[j].bytesused;
 
@@ -474,6 +479,11 @@ public:
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
+        }
+
+        // TODO: this isn't needed I think
+        if(!gotOutput) {
+            returnedOutput.output.clear();
         }
 
         returnedOutput.imageSize = decoderOutputSize;
