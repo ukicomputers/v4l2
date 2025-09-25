@@ -15,7 +15,6 @@
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/sysinfo.h>
 #include <cerrno>
 #include <string>
 #include <vector>
@@ -24,12 +23,14 @@
 #include <poll.h>
 #include <algorithm> // just for std::min
 #include <fstream>
+#include <iostream>
+#include <chrono>
 using namespace std;
 
 const string decoderDev = "/dev/video10";
 const string converterDev = "/dev/video12";
-const int eventTimeout = 500;
-const int memoryThreshold = 51200;
+const int eventTimeout = 10;
+const int memoryThreshold = 25600;
 
 struct Decoder {
     enum class InitStatus {
@@ -104,7 +105,6 @@ private:
     void munmapBuffers(vector<MemoryBuffer> &output) {
         for(const auto &buffer : output) {
             for(int j = 0; j < buffer.start.size(); j++) {
-                // TODO: check for improper unallocated behaviour of int in &output
                 if(buffer.start[j] != MAP_FAILED) {
                     munmap(buffer.start[j], buffer.planes[j].length);
                 }
@@ -181,12 +181,19 @@ private:
     }
 
     int getFreeMemory() {
-        struct sysinfo info;
-        if(sysinfo(&info) != 0) {
-            return -1;
+        ifstream status("/proc/meminfo");
+        if(!status) return -1;
+
+        string data;
+        while(getline(status, data)) {
+            if(data.find("MemAvailable") != string::npos) {
+                int usage = -1;
+                sscanf(data.c_str(), "MemAvailable: %d kB", &usage);
+                return usage;
+            }
         }
 
-        return ((info.freeram + info.freeswap) * info.mem_unit) / 1024;
+        return -1;
     }
 
     bool decodeMemoryAvailable() {
@@ -197,6 +204,11 @@ private:
                 return false;
             }
         } else {
+            const int usedMemory = getMemoryUsage();
+            if(usedMemory < 0) {
+                return false;
+            }
+
             if(getMemoryUsage() >= memoryLimit) {
                 return false;
             } else {
@@ -351,10 +363,15 @@ public:
             return returnedOutput;
         }
 
+        auto start = chrono::high_resolution_clock::now();
         if(!decodeMemoryAvailable()) {
+            cout << "insufficient memory\n";
             returnedOutput.status = Status::INSUFFICIENT_MEMORY;
             return returnedOutput;
         }
+        auto end = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+        cout << "decodeMemoryAvailable executed in " << duration << "ms\n";
 
         int inputType = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         int outputType = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -365,6 +382,7 @@ public:
                 xioctl(decoder, VIDIOC_STREAMON, &inputType) < 0 ||
                 xioctl(decoder, VIDIOC_STREAMON, &outputType) < 0
             ) {
+                cout << "streamon failed\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
@@ -378,6 +396,7 @@ public:
         {
             int remaining = data.size();
             const uint8_t *dataPtr = reinterpret_cast<const uint8_t *>(data.data());
+            int eagainCountIn = 0;
 
             while(remaining > 0) {
                 // input buffer handling
@@ -392,10 +411,13 @@ public:
                 if(xioctl(decoder, VIDIOC_DQBUF, &inputBuffer) < 0) {
                     if(errno == EAGAIN) {
                         if(waitEvent(decoder, POLLOUT | POLLWRNORM)) {
+                            eagainCountIn++;
+                            cout << "EAGAIN in input " << eagainCountIn << " time\n";
                             continue;
                         }
                     }
 
+                    cout << "error in dqbuf input\n";
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
@@ -414,6 +436,7 @@ public:
                 inputBuffer.m.planes = decoderInputBuffer[inputBuffer.index].planes.data();
 
                 if(xioctl(decoder, VIDIOC_QBUF, &inputBuffer) < 0) {
+                    cout << "error in qbuf input\n";
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
@@ -425,14 +448,9 @@ public:
         }
 
         // getting output buffers
-        bool gotOutput = false;
+        int eagainCountOut = 0;
 
         while(true) {
-            if(!decodeMemoryAvailable()) {
-                returnedOutput.status = Status::INSUFFICIENT_MEMORY;
-                return returnedOutput;
-            }
-
             // get decoded output
             v4l2_buffer outputBuffer = {};
             outputBuffer.type = outputType;
@@ -447,6 +465,8 @@ public:
                 if(errno == EAGAIN) {
                     // didn't process new incoming task yet
                     if(waitEvent(decoder, POLLIN | POLLRDNORM)) {
+                        eagainCountOut++;
+                        cout << "EAGAIN in output " << eagainCountOut << " time\n";
                         continue;
                     } else {
                         break;
@@ -458,11 +478,11 @@ public:
                     break;
                 }
 
+                cout << "error in dqbuf output\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
 
-            gotOutput = true;
             for(int j = 0; j < outputBuffer.length; j++) {
                 decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = planeData[j].bytesused;
 
@@ -476,14 +496,10 @@ public:
             outputBuffer.m.planes = decoderOutputBuffer[outputBuffer.index].planes.data();
 
             if(xioctl(decoder, VIDIOC_QBUF, &outputBuffer) < 0) {
+                cout << "error in qbuf input\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
-        }
-
-        // TODO: this isn't needed I think
-        if(!gotOutput) {
-            returnedOutput.output.clear();
         }
 
         returnedOutput.imageSize = decoderOutputSize;

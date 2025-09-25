@@ -8,7 +8,7 @@ using namespace std;
 const int inputVideoWidth = 1920;
 const int inputVideoHeight = 1080;
 const string inputVideoPath = "video.h264";
-const int chunkSize = 225280; // 220 KiB
+const int chunkSize = 102400; // 20 KiB
 
 const string outputPath = "video.yuv";
 
@@ -16,7 +16,7 @@ int main() {
     Decoder decoder;
 
     {
-        Decoder::InitStatus initStatus = decoder.initializeDecoder(inputVideoWidth, inputVideoHeight);
+        Decoder::InitStatus initStatus = decoder.initializeDecoder(inputVideoWidth, inputVideoHeight, 256 * 1024);
         if(initStatus != Decoder::InitStatus::OK) {
             cout << "Failed initializing decoder, error code: " << static_cast<int>(initStatus) << "\n";
             return 1;
