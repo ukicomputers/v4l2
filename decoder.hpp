@@ -21,16 +21,13 @@
 #include <cstring>
 #include <cstdint>
 #include <poll.h>
-#include <algorithm> // just for std::min
 #include <fstream>
-#include <iostream>
-#include <chrono>
 using namespace std;
 
-const string decoderDev = "/dev/video10";
-const string converterDev = "/dev/video12";
+const string decoderDev = "/dev/video10"; // default decoder device path
 const int eventTimeout = 10;
-const int memoryThreshold = 25600;
+const int memoryThreshold = 25600; // minimal free ram in KiB
+const int frameMemCheck = 10; // memory check on every n-th frame
 
 struct Decoder {
     enum class InitStatus {
@@ -64,17 +61,19 @@ private:
         vector<v4l2_plane> planes;
     };
 
+    int memoryLimit; // in KiB
+    int memoryFrame = frameMemCheck;
+
+    // decoder variables
     int decoder;
     bool decoderInitialized = false;
     bool decodeStreamStarted = false;
+    
     vector<MemoryBuffer> decoderOutputBuffer;
     vector<MemoryBuffer> decoderInputBuffer;
+    
     pair<int, int> decoderOutputSize;
-
-    int converter;
-    bool converterInitialized = false;
-
-    int memoryLimit; // in KiB
+    vector<uint8_t> partData;
 
     bool waitEvent(int fd, short events) {
         pollfd descriptor;
@@ -184,19 +183,29 @@ private:
         ifstream status("/proc/meminfo");
         if(!status) return -1;
 
+        int memory = 0;
         string data;
+
         while(getline(status, data)) {
             if(data.find("MemAvailable") != string::npos) {
-                int usage = -1;
+                int usage;
                 sscanf(data.c_str(), "MemAvailable: %d kB", &usage);
-                return usage;
+                memory += usage;
+            } else if(data.find("SwapFree") != string::npos) {
+                int usage;
+                sscanf(data.c_str(), "SwapFree: %d kB", &usage);
+                memory += usage;
             }
         }
 
-        return -1;
+        return memory;
     }
 
     bool decodeMemoryAvailable() {
+        if(++memoryFrame < frameMemCheck) {
+            return true;
+        }
+
         if(memoryLimit == -1) {
             if(getFreeMemory() >= memoryThreshold) {
                 return true;
@@ -215,6 +224,66 @@ private:
                 return true;
             }
         }
+    }
+
+    int min(int a, int b) {
+        if(a < b) {
+            return a;
+        } else {
+            return b;
+        }
+    }
+
+    pair<int, int> findNAL(const vector<uint8_t> &data, int start) {
+        for(; start + 2 < data.size(); start++) {
+            if(data[start] == 0x00 && data[start + 1] == 0x00) {
+                if(data[start + 2] == 0x01) {
+                    return {start, 3};
+                } else if(start < data.size() - 3 && data[start + 2] == 0x00 && data[start + 3] == 0x01) {
+                    return {start, 4};
+                }
+            }
+        }
+
+        return {-1, 0};
+    }
+
+    // TODO: for blocking mode do SPS/PPS/IDR
+    vector<uint8_t> parseNAL(const vector<char> &input) {
+        vector<uint8_t> data;
+        data.insert(data.end(), partData.begin(), partData.end());
+        partData.clear();
+        data.insert(data.end(), input.begin(), input.end());
+
+        vector<uint8_t> result;
+        int byte = 0;
+
+        auto start = findNAL(data, byte);
+        if(start.first < 0) {
+            partData = move(data);
+            return result;
+        }
+
+        byte = start.first + start.second;
+
+        while(byte < data.size()) {
+            auto next = findNAL(data, byte);
+            if(next.first < 0) {
+                partData.insert(partData.end(), data.begin() + start.first, data.end());
+                break;
+            }
+
+            if((data[start.first + start.second] & 0x1F) != 6) {
+                if(next.first > start.first) {
+                    result.insert(result.end(), data.begin() + start.first, data.begin() + next.first);
+                }
+            }
+
+            start = next;
+            byte = start.first + start.second;
+        }
+
+        return result;
     }
 public:
     ~Decoder() { unload(); }
@@ -239,14 +308,11 @@ public:
             decoderInitialized = false;
         }
 
-        if(converterInitialized) {
-            close(converter);
-            converterInitialized = false;
-        }
-
         decoderInputBuffer.clear();
         decoderOutputBuffer.clear();
+        partData.clear();
         decoderOutputSize = {};
+        memoryFrame = frameMemCheck;
     }
 
     /*
@@ -340,22 +406,23 @@ public:
     /* 
        notes for decoding:
     
-       once first frame is decoded, it is expected that you will decode more frames
+       once first frame is decoded, it is expected that you will decode more frames of same video
        to avoid any GPU blocking externally, once you are finished with constant decoding, destructure, or call stopDecoder
+       you also need to reinitialize if you are decoding a whole new file
 
        if last part of the H264 content is passed, you should set lastData bool to true
 
-       input must be progressive, and in Annex-B form
+       input must be Annex-B form (progressive input and not using B frames is also recommended)
 
-       you don't need to send full packets
-       for example, if reading from a file, you can read chunks, and send them here
-       when chunk is complete, the frame will be decoded and returned
+       Broadcom codec driver is stateful (it expects full, decodable NALs)
+       the program automatically handles incomplete NALs by removing them
+       and keeping until NAL is complete (sometimes, because of that, you may get no output)
 
        outcome image size may be different since size needs to be divisible by decoder stepsize
        image size will be increased to point of image size divisibility with stepsize
     */
     
-    DecodedFrame decode(const vector<char> &data, bool lastData) {
+    DecodedFrame decode(const vector<char> &input, bool lastData) {
         DecodedFrame returnedOutput;
 
         if(!decoderInitialized) {
@@ -363,15 +430,10 @@ public:
             return returnedOutput;
         }
 
-        auto start = chrono::high_resolution_clock::now();
         if(!decodeMemoryAvailable()) {
-            cout << "insufficient memory\n";
             returnedOutput.status = Status::INSUFFICIENT_MEMORY;
             return returnedOutput;
         }
-        auto end = chrono::high_resolution_clock::now();
-        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-        cout << "decodeMemoryAvailable executed in " << duration << "ms\n";
 
         int inputType = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         int outputType = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -382,7 +444,6 @@ public:
                 xioctl(decoder, VIDIOC_STREAMON, &inputType) < 0 ||
                 xioctl(decoder, VIDIOC_STREAMON, &outputType) < 0
             ) {
-                cout << "streamon failed\n";
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }
@@ -390,13 +451,22 @@ public:
             decodeStreamStarted = true;
         }
 
-        // TODO: maybe crop output image to original size
         // TODO: subscribe to resolution change events
+        // TODO: crop image to original values
         // feeding input buffers
         {
+            vector<uint8_t> data = parseNAL(input);
+            if(data.empty()) {
+                return returnedOutput;
+            }
+
+            if(lastData && !partData.empty()) {
+                data.insert(data.end(), partData.begin(), partData.end());
+                partData.clear();
+            }
+
             int remaining = data.size();
             const uint8_t *dataPtr = reinterpret_cast<const uint8_t *>(data.data());
-            int eagainCountIn = 0;
 
             while(remaining > 0) {
                 // input buffer handling
@@ -411,13 +481,12 @@ public:
                 if(xioctl(decoder, VIDIOC_DQBUF, &inputBuffer) < 0) {
                     if(errno == EAGAIN) {
                         if(waitEvent(decoder, POLLOUT | POLLWRNORM)) {
-                            eagainCountIn++;
-                            cout << "EAGAIN in input " << eagainCountIn << " time\n";
                             continue;
+                        } else {
+                            break;
                         }
                     }
 
-                    cout << "error in dqbuf input\n";
                     returnedOutput.status = Status::FAILED;
                     return returnedOutput;
                 }
@@ -435,21 +504,27 @@ public:
 
                 inputBuffer.m.planes = decoderInputBuffer[inputBuffer.index].planes.data();
 
-                if(xioctl(decoder, VIDIOC_QBUF, &inputBuffer) < 0) {
-                    cout << "error in qbuf input\n";
-                    returnedOutput.status = Status::FAILED;
-                    return returnedOutput;
-                }
-
                 // move onto next item
                 remaining -= copySize;
                 dataPtr += copySize;
+
+                if(xioctl(decoder, VIDIOC_QBUF, &inputBuffer) < 0) {
+                    if(errno == EAGAIN) {
+                        if(waitEvent(decoder, POLLOUT | POLLWRNORM)) {
+                            // one maximal retry
+                            if(xioctl(decoder, VIDIOC_QBUF, &inputBuffer) >= 0) continue;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    returnedOutput.status = Status::FAILED;
+                    return returnedOutput;
+                }
             }
         }
 
         // getting output buffers
-        int eagainCountOut = 0;
-
         while(true) {
             // get decoded output
             v4l2_buffer outputBuffer = {};
@@ -465,12 +540,11 @@ public:
                 if(errno == EAGAIN) {
                     // didn't process new incoming task yet
                     if(waitEvent(decoder, POLLIN | POLLRDNORM)) {
-                        eagainCountOut++;
-                        cout << "EAGAIN in output " << eagainCountOut << " time\n";
                         continue;
                     } else {
                         break;
                     }
+                    // break;
                 }
 
                 if(errno == EPIPE) {
@@ -478,8 +552,12 @@ public:
                     break;
                 }
 
-                cout << "error in dqbuf output\n";
                 returnedOutput.status = Status::FAILED;
+                return returnedOutput;
+            }
+
+            if(!decodeMemoryAvailable()) {
+                returnedOutput.status = Status::INSUFFICIENT_MEMORY;
                 return returnedOutput;
             }
 
@@ -489,14 +567,23 @@ public:
                 if(decoderOutputBuffer[outputBuffer.index].planes[j].bytesused > 0) {
                     const uint8_t *decodedData = static_cast<const uint8_t *>(decoderOutputBuffer[outputBuffer.index].start[j]);
                     returnedOutput.output.insert(returnedOutput.output.end(), decodedData, decodedData + decoderOutputBuffer[outputBuffer.index].planes[j].bytesused);
-                    decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = 0;
                 }
+
+                decoderOutputBuffer[outputBuffer.index].planes[j].bytesused = 0;
             }
 
             outputBuffer.m.planes = decoderOutputBuffer[outputBuffer.index].planes.data();
 
             if(xioctl(decoder, VIDIOC_QBUF, &outputBuffer) < 0) {
-                cout << "error in qbuf input\n";
+                if(errno == EAGAIN) {
+                    if(waitEvent(decoder, POLLOUT | POLLWRNORM)) {
+                        // one maximal retry
+                        if(xioctl(decoder, VIDIOC_QBUF, &outputBuffer)) continue;
+                    } else {
+                        break;
+                    }
+                }
+
                 returnedOutput.status = Status::FAILED;
                 return returnedOutput;
             }

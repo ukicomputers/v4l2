@@ -8,7 +8,7 @@ using namespace std;
 const int inputVideoWidth = 1920;
 const int inputVideoHeight = 1080;
 const string inputVideoPath = "video.h264";
-const int chunkSize = 102400; // 20 KiB
+const int chunkSize = 20480; // 20 KiB
 
 const string outputPath = "video.yuv";
 
